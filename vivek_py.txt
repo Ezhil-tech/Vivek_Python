@@ -1,0 +1,251 @@
+models.py 
+
+from django.contrib.auth.models import AbstractBaseUser, BaseUserManager
+from django.db import models
+from django.utils import timezone
+
+class UserManager(BaseUserManager):
+    def create_user(self, email, username, password=None):
+        if not email:
+            raise ValueError('Users must have an email address')
+        if not username:
+            raise ValueError('Users must have a username')
+
+        user = self.model(
+            email=self.normalize_email(email),
+            username=username,
+        )
+        user.set_password(password)  # Use set_password to hash the password
+        user.save(using=self._db)
+        return user
+
+    def create_superuser(self, email, username, password=None):
+        user = self.create_user(
+            email=email,
+            username=username,
+            password=password,
+        )
+        user.is_admin = True
+        user.save(using=self._db)
+        return user
+
+class OTP(models.Model):
+    email = models.EmailField()
+    otp_code = models.CharField(max_length=6)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    def is_valid(self):
+        return timezone.now() - self.created_at < timezone.timedelta(minutes=10)
+
+class User(AbstractBaseUser):
+    email = models.EmailField(unique=True)
+    username = models.CharField(max_length=150, unique=True)
+    is_active = models.BooleanField(default=True)
+    is_admin = models.BooleanField(default=False)
+    last_login = models.DateTimeField(null=True, blank=True, default=timezone.now)
+
+    objects = UserManager()
+
+    USERNAME_FIELD = 'email'
+    REQUIRED_FIELDS = ['username']
+
+    def __str__(self):
+        return self.email
+
+serializers.py
+
+from rest_framework import serializers
+from .models import User, OTP
+import re
+
+class UserSerializer(serializers.ModelSerializer):
+    password = serializers.CharField(write_only=True, required=True, min_length=8)
+
+    class Meta:
+        model = User
+        fields = ['email', 'username', 'password']
+
+    def validate_email(self, value):
+        # Check if the email is in lowercase
+        if value != value.lower():
+            raise serializers.ValidationError("Email must be in lowercase.")
+
+        # Check if the email contains exactly one @ symbol and ends with @gmail.com
+        email_regex = r"^[a-z0-9._%+-]+@gmail\.com$"
+        if not re.match(email_regex, value):
+            raise serializers.ValidationError("Enter a valid Gmail address in lowercase.")
+
+        return value
+
+    def validate_username(self, value):
+        # Ensure the username contains only alphabetic characters
+        if not value.isalpha():
+            raise serializers.ValidationError("Username must contain only alphabetic characters.")
+        return value
+    
+    def validate_password(self, value):
+        if len(value) < 8:
+            raise serializers.ValidationError("Password must be at least 8 characters long.")
+        if not re.search(r"[A-Z]", value):
+            raise serializers.ValidationError("Password must contain at least one uppercase letter.")
+        if not re.search(r"[a-z]", value):
+            raise serializers.ValidationError("Password must contain at least one lowercase letter.")
+        if not re.search(r"[0-9]", value):
+            raise serializers.ValidationError("Password must contain at least one digit.")
+        if not re.search(r"[#?!@$%^&*-]", value):
+            raise serializers.ValidationError("Password must contain at least one special character.")
+        return value
+
+    def create(self, validated_data):
+        user = User.objects.create_user(**validated_data)
+        return user
+
+class LoginSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    password = serializers.CharField()
+
+class PasswordResetSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    
+    def validate_email(self, value):
+        if not User.objects.filter(email=value).exists():
+            raise serializers.ValidationError("User with this email does not exist.")
+        return value
+
+class OTPVerificationSerializer(serializers.Serializer):
+    otp_code = serializers.CharField()
+
+    def validate(self, data):
+        try:
+            otp = OTP.objects.get(otp_code=data['otp_code'])
+            if not otp.is_valid():
+                raise serializers.ValidationError("OTP has expired.")
+        except OTP.DoesNotExist:
+            raise serializers.ValidationError("Invalid OTP.")
+        return data
+
+class ResetPasswordSerializer(serializers.Serializer):
+    new_password = serializers.CharField(write_only=True)
+    confirm_password = serializers.CharField(write_only=True)
+
+    def validate(self, data):
+        new_password = data.get('new_password')
+        confirm_password = data.get('confirm_password')
+
+        if new_password != confirm_password:
+            raise serializers.ValidationError("Passwords do not match.")
+
+        # Add any additional password validations if needed
+        return data
+
+    def save(self, **kwargs):
+        email = kwargs.get('email')
+        try:
+            user = User.objects.get(email=email)
+            user.set_password(self.validated_data['new_password'])
+            user.save()
+            return user
+        except User.DoesNotExist:
+            return None
+
+
+
+
+
+views.py
+
+from rest_framework import status
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from .models import User, OTP
+from .serializers import (
+    UserSerializer, LoginSerializer, PasswordResetSerializer,
+    OTPVerificationSerializer, ResetPasswordSerializer
+)
+import random
+from rest_framework.permissions import AllowAny
+
+class RegisterView(APIView):
+    def post(self, request):
+        serializer = UserSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response({"status": True, "message": "User registered successfully"}, status=status.HTTP_200_OK)
+        # Extract and return the first error message for each field
+        errors = serializer.errors
+        first_errors = {field: messages[0] for field, messages in errors.items()}
+        return Response({'status': False, **first_errors}, status=status.HTTP_400_BAD_REQUEST)
+
+class LoginView(APIView):
+    def post(self, request):
+        serializer = LoginSerializer(data=request.data)
+        if serializer.is_valid():
+            email = serializer.data.get('email')
+            password = serializer.data.get('password')
+            user = User.objects.filter(email=email).first()
+            if user and user.check_password(password):
+                return Response({"status": True, "message": "Login successful"}, status=status.HTTP_200_OK)
+            return Response({"status": False, "message": "Invalid credentials"}, status=status.HTTP_400_BAD_REQUEST)
+        # Extract and return the first error message for each field
+        errors = serializer.errors
+        first_errors = {field: messages[0] for field, messages in errors.items()}
+        return Response({'status': False, **first_errors}, status=status.HTTP_400_BAD_REQUEST)
+
+class ForgotPasswordView(APIView):
+    def post(self, request):
+        serializer = PasswordResetSerializer(data=request.data)
+        if serializer.is_valid():
+            email = serializer.validated_data.get('email')
+            user = User.objects.filter(email=email).first()
+            if user:
+                otp_code = str(random.randint(100000, 999999))
+                OTP.objects.create(email=email, otp_code=otp_code)
+                return Response({"status": True, "otp_code": otp_code, "message": "OTP successfully generated."}, status=status.HTTP_200_OK)
+            return Response({"status": False, "message": "User with this email does not exist."}, status=status.HTTP_400_BAD_REQUEST)
+        # Extract and return the first error message for each field
+        errors = serializer.errors
+        first_errors = {field: messages[0] for field, messages in errors.items()}
+        return Response({'status': False, **first_errors}, status=status.HTTP_400_BAD_REQUEST)
+
+class VerifyOTPView(APIView):
+    def post(self, request):
+        serializer = OTPVerificationSerializer(data=request.data)
+        if serializer.is_valid():
+            return Response({"status": True, "message": "OTP verified successfully."}, status=status.HTTP_200_OK)
+        # Extract the first error message
+        error_message = serializer.errors.get('non_field_errors', ["Invalid OTP."])[0]
+        return Response({"status": False, "message": error_message}, status=status.HTTP_400_BAD_REQUEST)
+
+class ResetPasswordView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = ResetPasswordSerializer(data=request.data)
+        if serializer.is_valid():
+            email = request.data.get('email')
+            try:
+                user = User.objects.get(email=email)
+                user.set_password(serializer.validated_data['new_password'])
+                user.save()
+                return Response({"status": True, "message": "Password reset successful."}, status=status.HTTP_200_OK)
+            except User.DoesNotExist:
+                return Response({"status": False, "message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+        # Extract and return the first error message for each field
+        errors = serializer.errors
+        first_errors = {field: messages[0] for field, messages in errors.items()}
+        return Response({'status': False, **first_errors}, status=status.HTTP_400_BAD_REQUEST)
+
+
+
+urls.py
+
+from django.urls import path
+from .views import RegisterView, LoginView, ForgotPasswordView, ResetPasswordView, VerifyOTPView
+
+urlpatterns = [
+    path('register/', RegisterView.as_view(), name='register'),
+    path('login/', LoginView.as_view(), name='login'),
+    path('forgot-password/', ForgotPasswordView.as_view(), name='forgot-password'),
+    path('verify-otp/', VerifyOTPView.as_view(), name='verify-otp'),
+    path('reset-password/', ResetPasswordView.as_view(), name='reset-password'),
+]
